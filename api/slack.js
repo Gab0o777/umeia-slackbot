@@ -9,21 +9,34 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ── Leer raw body (soporta stream y body pre-leido por Vercel) ─
+// ── Leer raw body ─────────────────────────────────────────────
 async function getRawBody(req) {
-  // Vercel a veces pre-lee el body y lo pone en req.body
-  if (req.body !== undefined) {
-    if (Buffer.isBuffer(req.body)) return req.body;
-    if (typeof req.body === 'string') return Buffer.from(req.body);
-    // objeto parseado → reconstruir como query string
-    const qs = require('querystring');
-    return Buffer.from(qs.stringify(req.body));
+  const bodyDefined = req.body !== undefined;
+  const bodyType    = typeof req.body;
+  console.log('[umeia-bot] getRawBody: bodyDefined=', bodyDefined, 'bodyType=', bodyType);
+
+  if (bodyDefined) {
+    if (Buffer.isBuffer(req.body)) {
+      console.log('[umeia-bot] path=Buffer, len=', req.body.length);
+      return req.body;
+    }
+    if (typeof req.body === 'string') {
+      console.log('[umeia-bot] path=string, len=', req.body.length, 'preview=', req.body.slice(0,80));
+      return Buffer.from(req.body);
+    }
+    // objeto parseado por Vercel → reconstruir
+    const qs  = require('querystring');
+    const str = qs.stringify(req.body);
+    console.log('[umeia-bot] path=object, keys=', Object.keys(req.body).join(','), 'reconstructed=', str.slice(0,80));
+    return Buffer.from(str);
   }
-  // Leer desde stream
+
+  // stream
+  console.log('[umeia-bot] path=stream');
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end',  () => resolve(Buffer.concat(chunks)));
+    req.on('end',  () => { const b = Buffer.concat(chunks); console.log('[umeia-bot] stream done, len=', b.length); resolve(b); });
     req.on('error', reject);
   });
 }
