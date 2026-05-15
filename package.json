@@ -1,12 +1,6 @@
 {
   "name": "umeia-slack-bot",
-  "version": "2.0.0",
-  "description": "Slack bot para crear tareas en Umeia",
-  "dependencies": {
-    "@slack/web-api": "^7.3.4",
-    "@supabase/supabase-js": "^2.45.4"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  "version": "3.0.0",
+  "description": "Slack bot para crear tareas en Umeia (Vercel Edge)",
+  "engines": { "node": ">=18" }
 }
