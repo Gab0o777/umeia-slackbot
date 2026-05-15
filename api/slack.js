@@ -9,8 +9,17 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ── Leer raw body desde el stream ─────────────────────────────
-function getRawBody(req) {
+// ── Leer raw body (soporta stream y body pre-leido por Vercel) ─
+async function getRawBody(req) {
+  // Vercel a veces pre-lee el body y lo pone en req.body
+  if (req.body !== undefined) {
+    if (Buffer.isBuffer(req.body)) return req.body;
+    if (typeof req.body === 'string') return Buffer.from(req.body);
+    // objeto parseado → reconstruir como query string
+    const qs = require('querystring');
+    return Buffer.from(qs.stringify(req.body));
+  }
+  // Leer desde stream
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -23,12 +32,23 @@ function getRawBody(req) {
 function verifySignature(rawBody, headers) {
   const timestamp = headers['x-slack-request-timestamp'];
   const signature = headers['x-slack-signature'];
+
+  console.log('[umeia-bot] verify debug:', {
+    rawBodyLength:   rawBody.length,
+    rawBodyPreview:  rawBody.toString().slice(0, 80),
+    timestamp,
+    slackSig:        signature?.slice(0, 20) + '...',
+    secretPrefix:    process.env.SLACK_SIGNING_SECRET?.slice(0, 6) + '...',
+  });
+
   if (!timestamp || !signature) return false;
   if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
 
   const hmac = crypto.createHmac('sha256', process.env.SLACK_SIGNING_SECRET);
   hmac.update(`v0:${timestamp}:${rawBody.toString()}`);
   const expected = `v0=${hmac.digest('hex')}`;
+
+  console.log('[umeia-bot] expected sig prefix:', expected.slice(0, 20) + '...');
 
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
