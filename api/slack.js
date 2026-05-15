@@ -23,6 +23,7 @@ const supabase = createClient(
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   processBeforeResponse: true,
+  endpoints: '/api/slack',
 });
 
 const app = new App({
