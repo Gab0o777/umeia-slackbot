@@ -19,24 +19,23 @@ async function verifySignature(rawBody, headers) {
   return hex === signature;
 }
 
-// ── Supabase ──────────────────────────────────────────────────
-async function dbSelect(table, query = '') {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, {
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
-  });
-  return res.json();
+// ── Helpers ───────────────────────────────────────────────────
+const dbHeaders = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` };
+
+async function dbGet(table, query = '') {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, { headers: dbHeaders });
+  return res.ok ? res.json() : [];
 }
 
 async function dbInsert(table, data) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    headers: { ...dbHeaders, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(await res.text());
 }
 
-// ── Slack API ─────────────────────────────────────────────────
 async function slackApi(method, body) {
   const res = await fetch(`https://slack.com/api/${method}`, {
     method: 'POST',
@@ -46,133 +45,94 @@ async function slackApi(method, body) {
   return res.json();
 }
 
-// ── Active sprint ─────────────────────────────────────────────
-async function getActiveSprint() {
-  const settings = await dbSelect('settings', 'key=eq.active_sprint_id&select=value');
-  const id = Array.isArray(settings) && settings[0]?.value ? Number(settings[0].value) : null;
-  if (!id) return null;
-  const sprints = await dbSelect('sprints', `id=eq.${id}&select=id,name,title,start_date,target_end`);
-  return Array.isArray(sprints) ? sprints[0] : null;
+function jsonResp(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 // ── /projects status ──────────────────────────────────────────
-async function handleStatus(channelId, userId) {
-  // Fetch en paralelo
-  const [webhookData, infraData, deploysData, logsData, activeSprint, taskRows] = await Promise.allSettled([
+// Retorna directo en la respuesta HTTP → no hay race con el Edge timeout
+async function buildStatusResponse() {
+  const [wh, infra, deps, logsData, settingsRows, allTasks, sprints] = await Promise.all([
     fetch(`${API_BASE}/api/metrics/webhooks?hours=1`).then(r => r.json()).catch(() => null),
     fetch(`${API_BASE}/api/metrics/infra`).then(r => r.json()).catch(() => null),
-    fetch(`${API_BASE}/api/metrics/deploys?limit=3`).then(r => r.json()).catch(() => null),
+    fetch(`${API_BASE}/api/metrics/deploys?limit=1`).then(r => r.json()).catch(() => null),
     fetch(`${API_BASE}/api/metrics/logs?hours=1&limit=200`).then(r => r.json()).catch(() => null),
-    getActiveSprint(),
-    dbSelect('tasks', 'select=status,sprint_id'),
+    dbGet('settings', 'key=eq.active_sprint_id&select=value'),
+    dbGet('tasks', 'select=status,sprint_id'),
+    dbGet('sprints', 'select=id,name,title'),
   ]);
 
-  const wh     = webhookData.value;
-  const infra  = infraData.value;
-  const deps   = deploysData.value?.deploys ?? [];
-  const logs   = logsData.value?.logs ?? [];
-  const sprint = activeSprint.value;
-  const tasks  = Array.isArray(taskRows.value) ? taskRows.value : [];
-
-  // RPM (últimos 60 min)
+  // RPM y avg latency desde logs
+  const logs = logsData?.logs ?? [];
   const processed = logs.filter(l => l.line?.includes('inbound_webhook_processed')).length;
   const rpm = (processed / 60).toFixed(2);
-
-  // Avg response time
   const durations = logs.map(l => { const m = l.line?.match(/duration_ms=(\d+)/); return m ? Number(m[1]) : null; }).filter(Boolean);
   const avgMs = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null;
 
-  // Tareas del sprint activo
-  const sprintTasks = sprint ? tasks.filter(t => t.sprint_id === sprint.id) : [];
-  const byStatus = {
-    completado:  sprintTasks.filter(t => t.status === 'completado').length,
-    en_proceso:  sprintTasks.filter(t => t.status === 'en_proceso').length,
-    bloqueado:   sprintTasks.filter(t => t.status === 'bloqueado').length,
-    no_iniciado: sprintTasks.filter(t => t.status === 'no_iniciado').length,
-  };
-  const progress = sprintTasks.length ? Math.round((byStatus.completado / sprintTasks.length) * 100) : 0;
-  const progressBar = '█'.repeat(Math.round(progress / 10)) + '░'.repeat(10 - Math.round(progress / 10));
+  // Sprint activo
+  const activeId = settingsRows?.[0]?.value ? Number(settingsRows[0].value) : null;
+  const sprint   = activeId ? (sprints ?? []).find(s => s.id === activeId) : null;
+  const tasks    = Array.isArray(allTasks) ? allTasks : [];
+  const st       = sprint ? tasks.filter(t => t.sprint_id === sprint.id) : [];
+  const done     = st.filter(t => t.status === 'completado').length;
+  const progress = st.length ? Math.round((done / st.length) * 100) : 0;
+  const bar      = '█'.repeat(Math.round(progress / 10)) + '░'.repeat(10 - Math.round(progress / 10));
 
-  // CPU / RAM
-  const cpu  = infra?.cpu_pct != null  ? `${infra.cpu_pct.toFixed(1)}%`  : '—';
-  const ram  = infra?.ram_pct != null  ? `${infra.ram_pct.toFixed(1)}%`  : '—';
-  const disk = infra?.disk_pct != null ? `${infra.disk_pct.toFixed(1)}%` : '—';
-  const uptime = infra?.uptime_hours != null ? `${infra.uptime_hours}h`  : '—';
+  // Infra
+  const cpu    = infra?.cpu_pct  != null ? `${infra.cpu_pct.toFixed(1)}%`  : '—';
+  const ram    = infra?.ram_pct  != null ? `${infra.ram_pct.toFixed(1)}%`  : '—';
+  const disk   = infra?.disk_pct != null ? `${infra.disk_pct.toFixed(1)}%` : '—';
+  const uptime = infra?.uptime_hours != null ? `${infra.uptime_hours}h` : '—';
 
   // Último deploy
-  const lastDeploy = deps[0];
-  const deployStatus = lastDeploy
-    ? `${lastDeploy.conclusion === 'success' ? '✅' : lastDeploy.conclusion === 'failure' ? '❌' : '🔄'} ${lastDeploy.name ?? 'Deploy'} — @${lastDeploy.actor}`
+  const dep = deps?.deploys?.[0];
+  const depLine = dep
+    ? `${dep.conclusion === 'success' ? '✅' : dep.conclusion === 'failure' ? '❌' : '🔄'} ${dep.name ?? 'Deploy'} — @${dep.actor}`
     : '—';
 
-  const blocks = [
-    {
-      type: 'header',
-      text: { type: 'plain_text', text: '📊 Status de Umeia' },
-    },
+  return {
+    response_type: 'in_channel',
+    blocks: [
+      { type: 'header', text: { type: 'plain_text', text: '📊 Status de Umeia' } },
 
-    // ── Sprint activo ───────────────────────────────────────
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: sprint
-          ? `*⚡ Sprint activo: ${sprint.title || sprint.name}*\n${progressBar} *${progress}%* completado\n✅ ${byStatus.completado}  🔄 ${byStatus.en_proceso}  🚫 ${byStatus.bloqueado}  ⏳ ${byStatus.no_iniciado}`
-          : '*Sprint activo:* ninguno configurado',
-      },
-    },
+      { type: 'section', text: { type: 'mrkdwn', text: sprint
+        ? `*⚡ Sprint activo: ${sprint.title || sprint.name}*\n${bar} *${progress}%* completado  ·  ✅ ${done}/${st.length} tareas`
+        : '*Sprint activo:* ninguno configurado' } },
 
-    { type: 'divider' },
+      { type: 'divider' },
 
-    // ── API metrics ─────────────────────────────────────────
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: '*🌐 API — últimos 60 min*' },
-      fields: [
-        { type: 'mrkdwn', text: `*Webhooks*\n${wh?.total ?? '—'}` },
-        { type: 'mrkdwn', text: `*RPM*\n${rpm}` },
-        { type: 'mrkdwn', text: `*Avg response*\n${avgMs != null ? `${avgMs}ms` : '—'}` },
-        { type: 'mrkdwn', text: `*Errores*\n${wh?.errors != null ? (wh.errors > 0 ? `⚠️ ${wh.errors}` : '0') : '—'}` },
-      ],
-    },
+      { type: 'section',
+        text: { type: 'mrkdwn', text: '*🌐 API — últimos 60 min*' },
+        fields: [
+          { type: 'mrkdwn', text: `*Webhooks*\n${wh?.total ?? '—'}` },
+          { type: 'mrkdwn', text: `*RPM*\n${rpm}` },
+          { type: 'mrkdwn', text: `*Avg response*\n${avgMs != null ? `${avgMs}ms` : '—'}` },
+          { type: 'mrkdwn', text: `*Errores*\n${wh?.errors != null ? (wh.errors > 0 ? `⚠️ ${wh.errors}` : '0') : '—'}` },
+        ] },
 
-    { type: 'divider' },
+      { type: 'divider' },
 
-    // ── Infra ────────────────────────────────────────────────
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: '*🖥️ Infraestructura*' },
-      fields: [
-        { type: 'mrkdwn', text: `*CPU*\n${cpu}` },
-        { type: 'mrkdwn', text: `*RAM*\n${ram}` },
-        { type: 'mrkdwn', text: `*Disco*\n${disk}` },
-        { type: 'mrkdwn', text: `*Uptime*\n${uptime}` },
-      ],
-    },
+      { type: 'section',
+        text: { type: 'mrkdwn', text: '*🖥️ Infraestructura*' },
+        fields: [
+          { type: 'mrkdwn', text: `*CPU*\n${cpu}` },
+          { type: 'mrkdwn', text: `*RAM*\n${ram}` },
+          { type: 'mrkdwn', text: `*Disco*\n${disk}` },
+          { type: 'mrkdwn', text: `*Uptime*\n${uptime}` },
+        ] },
 
-    { type: 'divider' },
-
-    // ── Último deploy ─────────────────────────────────────────
-    {
-      type: 'context',
-      elements: [
-        { type: 'mrkdwn', text: `*Último deploy:* ${deployStatus}` },
-        { type: 'mrkdwn', text: `Grafana: <https://umeia.grafana.net/d/ga4sq8v/umeia-core-e28094-produccion|Ver dashboard>` },
-      ],
-    },
-  ];
-
-  await slackApi('chat.postMessage', {
-    channel: channelId || userId,
-    blocks,
-    text: `📊 Status Umeia — ${progress}% sprint completado | RPM: ${rpm} | CPU: ${cpu} | RAM: ${ram}`,
-  });
+      { type: 'context', elements: [
+        { type: 'mrkdwn', text: `*Último deploy:* ${depLine}` },
+        { type: 'mrkdwn', text: `<https://umeia.grafana.net/d/ga4sq8v/umeia-core-e28094-produccion|Ver Grafana →>` },
+      ]},
+    ],
+  };
 }
 
 // ── Modal create-task ─────────────────────────────────────────
-function buildModal(sprints, activeSprint) {
-  const active = activeSprint;
-  const rest   = (sprints || []).filter(s => !active || s.id !== active.id);
+function buildModal(sprints, activeId, channelId) {
+  const active = (sprints || []).find(s => s.id === activeId);
+  const rest   = (sprints || []).filter(s => s.id !== activeId);
 
   const sprintOptions = [
     ...(active ? [{ text: { type: 'plain_text', text: `⚡ Sprint activo — ${active.title || active.name}` }, value: String(active.id) }] : []),
@@ -185,24 +145,25 @@ function buildModal(sprints, activeSprint) {
 
   return {
     type: 'modal', callback_id: 'crear_tarea',
-    title:  { type: 'plain_text', text: 'Nueva Tarea'  },
-    submit: { type: 'plain_text', text: 'Crear tarea'  },
-    close:  { type: 'plain_text', text: 'Cancelar'     },
+    private_metadata: channelId,
+    title:  { type: 'plain_text', text: 'Nueva Tarea' },
+    submit: { type: 'plain_text', text: 'Crear tarea' },
+    close:  { type: 'plain_text', text: 'Cancelar'   },
     blocks: [
       { type: 'input', block_id: 'titulo',
         label: { type: 'plain_text', text: 'Título' },
-        element: { type: 'plain_text_input', action_id: 'titulo_input', placeholder: { type: 'plain_text', text: 'Ej: Fix bug en login' } } },
+        element: { type: 'plain_text_input', action_id: 'titulo_input',
+          placeholder: { type: 'plain_text', text: 'Ej: Fix bug en login' } } },
       { type: 'input', block_id: 'destino',
         label: { type: 'plain_text', text: 'Destino' },
         element: { type: 'static_select', action_id: 'destino_select',
           placeholder: { type: 'plain_text', text: 'Sprint o Backlog...' },
           options: sprintOptions,
-          ...(sprintOptions[0] ? { initial_option: sprintOptions[0] } : {}),
-        } },
+          ...(sprintOptions[0] ? { initial_option: sprintOptions[0] } : {}) } },
       { type: 'input', block_id: 'prioridad',
         label: { type: 'plain_text', text: 'Prioridad' },
         element: { type: 'static_select', action_id: 'prioridad_select',
-          initial_option: { text: { type: 'plain_text', text: 'Media' }, value: 'media' },
+          initial_option: { text: { type: 'plain_text', text: '🟡 Media' }, value: 'media' },
           options: [
             { text: { type: 'plain_text', text: '🔴 Alta'  }, value: 'alta'  },
             { text: { type: 'plain_text', text: '🟡 Media' }, value: 'media' },
@@ -210,24 +171,10 @@ function buildModal(sprints, activeSprint) {
           ] } },
       { type: 'input', block_id: 'responsable', optional: true,
         label: { type: 'plain_text', text: 'Responsable' },
-        element: { type: 'plain_text_input', action_id: 'responsable_input', placeholder: { type: 'plain_text', text: 'Ej: Lorenzo' } } },
+        element: { type: 'plain_text_input', action_id: 'responsable_input',
+          placeholder: { type: 'plain_text', text: 'Ej: Lorenzo' } } },
     ],
   };
-}
-
-// ── Ayuda ─────────────────────────────────────────────────────
-async function handleHelp(channelId) {
-  await slackApi('chat.postMessage', {
-    channel: channelId,
-    blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: '*📚 Comandos disponibles de /projects*' } },
-      { type: 'section', fields: [
-        { type: 'mrkdwn', text: '`/projects create-task`\nCrea una nueva tarea con modal' },
-        { type: 'mrkdwn', text: '`/projects status`\nMétricas de API e infra en tiempo real' },
-      ]},
-    ],
-    text: 'Comandos: /projects create-task | /projects status',
-  });
 }
 
 // ── Modal submit ──────────────────────────────────────────────
@@ -241,16 +188,15 @@ async function handleViewSubmission(payload) {
   const channelId   = payload.view.private_metadata;
   if (!titulo) return;
 
-  let destinoNombre = 'Backlog';
-  if (sprintId !== -1) {
-    const sp = await dbSelect('sprints', `id=eq.${sprintId}&select=name,title`);
-    const s  = Array.isArray(sp) ? sp[0] : null;
-    destinoNombre = s ? (s.title || s.name) : `Sprint ${sprintId}`;
-  }
+  const [sprintRows, existing] = await Promise.all([
+    sprintId !== -1 ? dbGet('sprints', `id=eq.${sprintId}&select=name,title`) : Promise.resolve([]),
+    dbGet('tasks', `sprint_id=eq.${sprintId}&select=id`),
+  ]);
 
-  const existing  = await dbSelect('tasks', `sprint_id=eq.${sprintId}&select=id`);
-  const sortOrder = Array.isArray(existing) ? existing.length : 999;
-  const prioEmoji = { alta: '🔴', media: '🟡', baja: '🟢' }[prioridad] || '';
+  const sp           = sprintRows?.[0];
+  const destinoNombre = sprintId === -1 ? 'Backlog' : (sp?.title || sp?.name || `Sprint ${sprintId}`);
+  const sortOrder     = Array.isArray(existing) ? existing.length : 999;
+  const prioEmoji     = { alta: '🔴', media: '🟡', baja: '🟢' }[prioridad] || '';
 
   try {
     await dbInsert('tasks', {
@@ -269,11 +215,14 @@ async function handleViewSubmission(payload) {
       ]},
     ];
 
-    if (channelId) await slackApi('chat.postMessage', { channel: channelId, blocks, text: `✅ Tarea "${titulo}" creada en ${destinoNombre}` });
-    await slackApi('chat.postMessage', { channel: userId, text: `✅ *${titulo}* creada en ${destinoNombre}` });
+    const promises = [slackApi('chat.postMessage', { channel: userId, text: `✅ *${titulo}* creada en ${destinoNombre}` })];
+    if (channelId && channelId !== userId) {
+      promises.push(slackApi('chat.postMessage', { channel: channelId, blocks, text: `✅ Tarea "${titulo}" creada en ${destinoNombre}` }));
+    }
+    await Promise.all(promises);
   } catch (e) {
     console.error('[umeia-bot] insert error:', e.message);
-    await slackApi('chat.postMessage', { channel: userId, text: 'Error al crear la tarea. Revisá los logs de Vercel.' });
+    await slackApi('chat.postMessage', { channel: userId, text: 'Error al crear la tarea. Revisá los logs.' });
   }
 }
 
@@ -283,43 +232,50 @@ export default async function handler(req) {
   if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
   const rawBody = await req.text();
-
   if (!await verifySignature(rawBody, req.headers))
     return new Response('Unauthorized', { status: 401 });
 
   const body = Object.fromEntries(new URLSearchParams(rawBody));
 
-  // ── Slash command /projects ─────────────────────────────────
+  // ── /projects ───────────────────────────────────────────────
   if (body.command === '/projects') {
     const sub = (body.text || '').trim().toLowerCase();
 
+    // status → respuesta directa en el cuerpo HTTP (evita race con timeout de Edge)
     if (sub === 'status') {
-      // ACK inmediato, proceso en background
-      const channelId = body.channel_id;
-      const userId    = body.user_id;
-      const resp = new Response('', { status: 200 });
-      // Edge permite seguir procesando después del return implícito
-      handleStatus(channelId, userId).catch(e => console.error('[umeia-bot] status error:', e));
-      return resp;
+      try {
+        const data = await buildStatusResponse();
+        return jsonResp(data);
+      } catch (e) {
+        console.error('[umeia-bot] status error:', e);
+        return jsonResp({ response_type: 'ephemeral', text: '❌ Error al obtener métricas.' });
+      }
     }
 
+    // create-task → fetch en paralelo + abrir modal
     if (sub === 'create-task' || sub === '') {
-      const channelId    = body.channel_id;
-      const [sprints, activeSprint] = await Promise.all([
-        dbSelect('sprints', 'select=id,name,title&order=id'),
-        getActiveSprint(),
-      ]);
-      const result = await slackApi('views.open', {
-        trigger_id: body.trigger_id,
-        view: { ...buildModal(sprints, activeSprint), private_metadata: channelId },
-      });
-      console.log('[umeia-bot] views.open:', result.ok, result.error || '');
+      try {
+        const [sprints, settings] = await Promise.all([
+          dbGet('sprints', 'select=id,name,title&order=id'),
+          dbGet('settings', 'key=eq.active_sprint_id&select=value'),
+        ]);
+        const activeId = settings?.[0]?.value ? Number(settings[0].value) : null;
+        const result = await slackApi('views.open', {
+          trigger_id: body.trigger_id,
+          view: buildModal(sprints, activeId, body.channel_id),
+        });
+        if (!result.ok) console.error('[umeia-bot] views.open error:', result.error);
+      } catch (e) {
+        console.error('[umeia-bot] create-task error:', e);
+      }
       return new Response('', { status: 200 });
     }
 
-    // Comando desconocido → ayuda
-    handleHelp(body.channel_id).catch(console.error);
-    return new Response('', { status: 200 });
+    // ayuda
+    return jsonResp({
+      response_type: 'ephemeral',
+      text: '*Comandos disponibles:*\n• `/projects create-task` — crear nueva tarea\n• `/projects status` — métricas de API e infra',
+    });
   }
 
   // ── Modal submit ────────────────────────────────────────────
@@ -328,12 +284,12 @@ export default async function handler(req) {
     try { payload = JSON.parse(body.payload); } catch { return new Response('Bad payload', { status: 400 }); }
 
     if (payload.type === 'view_submission' && payload.view?.callback_id === 'crear_tarea') {
-      handleViewSubmission(payload).catch(e => console.error('[umeia-bot] view error:', e));
-      return new Response(JSON.stringify({ response_action: 'clear' }), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      // ACK inmediato a Slack, procesar en paralelo
+      const submitPromise = handleViewSubmission(payload).catch(e => console.error('[umeia-bot]', e));
+      await submitPromise; // Edge necesita que terminemos antes de responder
+      return jsonResp({ response_action: 'clear' });
     }
   }
 
-  return new Response('OK', { status: 200 });
+  return new Response('OK');
 }
