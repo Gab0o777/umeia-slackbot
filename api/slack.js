@@ -91,6 +91,25 @@ export default async function handler(req) {
 
   const rawBody = await req.text(); // raw, sin parsear
 
+  // ── DEBUG COMPLETO ─────────────────────────────────────────
+  const ts  = req.headers.get('x-slack-request-timestamp');
+  const sig = req.headers.get('x-slack-signature');
+  const enc2 = new TextEncoder();
+  const k2  = await crypto.subtle.importKey('raw', enc2.encode(SIGNING_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sb2 = await crypto.subtle.sign('HMAC', k2, enc2.encode(`v0:${ts}:${rawBody}`));
+  const computed = 'v0=' + Array.from(new Uint8Array(sb2)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  console.log('[DEBUG]', JSON.stringify({
+    secretLen:    SIGNING_SECRET?.length,
+    secretPrefix: SIGNING_SECRET?.slice(0,8),
+    rawBodyLen:   rawBody.length,
+    rawBody:      rawBody,
+    timestamp:    ts,
+    slackSig:     sig,
+    computed:     computed,
+    match:        computed === sig,
+  }));
+  // ── FIN DEBUG ────────────────────────────────────────────────
+
   if (!await verifySignature(rawBody, req.headers)) {
     console.log('[umeia-bot] Signature mismatch');
     return new Response('Unauthorized', { status: 401 });
