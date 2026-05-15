@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "routes": [
+    {
+      "src": "/api/slack",
+      "dest": "/api/slack.js"
+    }
+  ]
+}
