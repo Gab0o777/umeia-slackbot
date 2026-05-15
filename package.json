@@ -1,13 +1,9 @@
 {
   "name": "umeia-slack-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Slack bot para crear tareas en Umeia",
-  "main": "api/slack.js",
-  "scripts": {
-    "dev": "node api/slack.js"
-  },
   "dependencies": {
-    "@slack/bolt": "^3.21.1",
+    "@slack/web-api": "^7.3.4",
     "@supabase/supabase-js": "^2.45.4"
   },
   "engines": {
