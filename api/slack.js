@@ -209,4 +209,8 @@ app.view('crear_tarea', async ({ ack, view, body, client }) => {
 });
 
 // ── Export para Vercel ────────────────────────────────────────
-module.exports = receiver.app;
+// Wrapper necesario para que Vercel no parsee el body antes que Bolt
+// (si Vercel parsea primero, la verificación de firma de Slack falla)
+const handler = (req, res) => receiver.app(req, res);
+handler.config = { api: { bodyParser: false } };
+module.exports = handler;
