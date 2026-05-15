@@ -1,6 +1,18 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
 const { createClient } = require('@supabase/supabase-js');
 
+// ── Debug: verificar variables de entorno ─────────────────────
+console.log('[umeia-bot] ENV CHECK:', {
+  SLACK_BOT_TOKEN:        process.env.SLACK_BOT_TOKEN        ? `${process.env.SLACK_BOT_TOKEN.slice(0,10)}...` : 'MISSING',
+  SLACK_SIGNING_SECRET:   process.env.SLACK_SIGNING_SECRET   ? 'OK' : 'MISSING',
+  SUPABASE_URL:           process.env.SUPABASE_URL           ? 'OK' : 'MISSING',
+  SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'OK' : 'MISSING',
+});
+
+if (!process.env.SLACK_BOT_TOKEN || !process.env.SLACK_SIGNING_SECRET) {
+  throw new Error('Faltan variables de entorno: SLACK_BOT_TOKEN y/o SLACK_SIGNING_SECRET');
+}
+
 // ── Supabase ──────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
